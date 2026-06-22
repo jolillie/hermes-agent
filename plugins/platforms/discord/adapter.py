@@ -4919,6 +4919,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 session_key=session_key,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                default=default,
             )
             msg = await channel.send(embed=embed, view=view)
             view._message = msg  # store for on_timeout expiration editing
@@ -5995,7 +5996,7 @@ def _define_discord_view_classes() -> None:
                     pass
 
     class UpdatePromptView(discord.ui.View):
-        """Interactive Yes/No buttons for ``hermes update`` prompts.
+        """Interactive approval buttons for ``hermes update`` prompts.
 
         Clicking a button writes the answer to ``.update_response`` so the
         detached update process can pick it up.  Only authorized users can
@@ -6008,12 +6009,56 @@ def _define_discord_view_classes() -> None:
             session_key: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            default: str = "",
         ):
             super().__init__(timeout=300)
             self.session_key = session_key
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.default = (default or "").strip()
             self.resolved = False
+            self._build_buttons()
+
+        def _build_buttons(self) -> None:
+            """Build explicit buttons instead of relying on decorator magic.
+
+            Jon's fork carries this as a local UX patch: update prompts should
+            read like approval actions, not a vague yes/no quiz.  Programmatic
+            buttons are also easier to test with Hermes' lightweight Discord
+            mock than decorator-collected methods.
+            """
+            yes_btn = discord.ui.Button(
+                label="Approve / Yes",
+                style=discord.ButtonStyle.green,
+                custom_id="update_prompt_approve",
+                emoji="✅",
+            )
+            yes_btn.callback = self._on_approve
+            self.add_item(yes_btn)
+
+            no_btn = discord.ui.Button(
+                label="Deny / No",
+                style=discord.ButtonStyle.red,
+                custom_id="update_prompt_deny",
+                emoji="⛔",
+            )
+            no_btn.callback = self._on_deny
+            self.add_item(no_btn)
+
+            if self.default:
+                default_label = "Use Default"
+                if self.default.lower() in {"y", "yes"}:
+                    default_label = "Use Default (Yes)"
+                elif self.default.lower() in {"n", "no"}:
+                    default_label = "Use Default (No)"
+                default_btn = discord.ui.Button(
+                    label=default_label,
+                    style=discord.ButtonStyle.grey,
+                    custom_id="update_prompt_default",
+                    emoji="↩️",
+                )
+                default_btn.callback = self._on_default
+                self.add_item(default_btn)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
@@ -6062,17 +6107,20 @@ def _define_discord_view_classes() -> None:
             except Exception as exc:
                 logger.error("Failed to write update response: %s", exc)
 
-        @discord.ui.button(label="Yes", style=discord.ButtonStyle.green, emoji="✓")
-        async def yes_btn(
-            self, interaction: discord.Interaction, button: discord.ui.Button
-        ):
+        async def _on_approve(self, interaction: discord.Interaction):
             await self._respond(interaction, "y", discord.Color.green(), "Yes")
 
-        @discord.ui.button(label="No", style=discord.ButtonStyle.red, emoji="✗")
-        async def no_btn(
-            self, interaction: discord.Interaction, button: discord.ui.Button
-        ):
+        async def _on_deny(self, interaction: discord.Interaction):
             await self._respond(interaction, "n", discord.Color.red(), "No")
+
+        async def _on_default(self, interaction: discord.Interaction):
+            answer = self.default or ""
+            label = "Default"
+            if answer.lower() in {"y", "yes"}:
+                label = "Default: Yes"
+            elif answer.lower() in {"n", "no"}:
+                label = "Default: No"
+            await self._respond(interaction, answer, discord.Color.greyple(), label)
 
         async def on_timeout(self):
             self.resolved = True
