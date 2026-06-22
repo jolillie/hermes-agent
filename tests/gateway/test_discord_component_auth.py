@@ -235,6 +235,30 @@ def test_update_prompt_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
 
 
+def test_update_prompt_view_builds_approval_action_buttons():
+    view = UpdatePromptView(
+        session_key="sess-1",
+        allowed_user_ids={"11111"},
+        default="y",
+    )
+
+    labels = [child.label for child in view.children]
+    custom_ids = [child.custom_id for child in view.children]
+
+    assert labels == ["Approve / Yes", "Deny / No", "Use Default (Yes)"]
+    assert custom_ids == [
+        "update_prompt_approve",
+        "update_prompt_deny",
+        "update_prompt_default",
+    ]
+
+
+def test_update_prompt_view_omits_default_button_without_default():
+    view = UpdatePromptView(session_key="sess-1", allowed_user_ids={"11111"})
+
+    assert [child.label for child in view.children] == ["Approve / Yes", "Deny / No"]
+
+
 def test_model_picker_view_accepts_role_allowlist():
     async def _noop(*_a, **_k):
         return ""
