@@ -235,7 +235,7 @@ def test_update_prompt_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
 
 
-def test_update_prompt_view_builds_approval_action_buttons():
+def test_update_prompt_view_builds_investigation_action_buttons():
     view = UpdatePromptView(
         session_key="sess-1",
         allowed_user_ids={"11111"},
@@ -245,7 +245,7 @@ def test_update_prompt_view_builds_approval_action_buttons():
     labels = [child.label for child in view.children]
     custom_ids = [child.custom_id for child in view.children]
 
-    assert labels == ["Approve / Yes", "Deny / No", "Use Default (Yes)"]
+    assert labels == ["Investigate now", "Remind later", "Skip this version"]
     assert custom_ids == [
         "update_prompt_approve",
         "update_prompt_deny",
@@ -253,10 +253,14 @@ def test_update_prompt_view_builds_approval_action_buttons():
     ]
 
 
-def test_update_prompt_view_omits_default_button_without_default():
+def test_update_prompt_view_always_offers_skip_button_without_default():
     view = UpdatePromptView(session_key="sess-1", allowed_user_ids={"11111"})
 
-    assert [child.label for child in view.children] == ["Approve / Yes", "Deny / No"]
+    assert [child.label for child in view.children] == [
+        "Investigate now",
+        "Remind later",
+        "Skip this version",
+    ]
 
 
 def test_model_picker_view_accepts_role_allowlist():

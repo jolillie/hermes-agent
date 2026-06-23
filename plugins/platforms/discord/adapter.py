@@ -6175,43 +6175,40 @@ def _define_discord_view_classes() -> None:
         def _build_buttons(self) -> None:
             """Build explicit buttons instead of relying on decorator magic.
 
-            Jon's fork carries this as a local UX patch: update prompts should
-            read like approval actions, not a vague yes/no quiz.  Programmatic
-            buttons are also easier to test with Hermes' lightweight Discord
-            mock than decorator-collected methods.
+            Jon's fork carries this as a local UX patch: the gateway-facing
+            update prompt is the first stage of a safe update flow.  The
+            primary action should read as an investigation, not immediate
+            production approval; promotion/restart remains a later explicit
+            step after tests pass.  Programmatic buttons are also easier to
+            test with Hermes' lightweight Discord mock than decorator-collected
+            methods.
             """
-            yes_btn = discord.ui.Button(
-                label="Approve / Yes",
+            investigate_btn = discord.ui.Button(
+                label="Investigate now",
                 style=discord.ButtonStyle.green,
                 custom_id="update_prompt_approve",
-                emoji="✅",
+                emoji="🔎",
             )
-            yes_btn.callback = self._on_approve
-            self.add_item(yes_btn)
+            investigate_btn.callback = self._on_approve
+            self.add_item(investigate_btn)
 
-            no_btn = discord.ui.Button(
-                label="Deny / No",
-                style=discord.ButtonStyle.red,
+            later_btn = discord.ui.Button(
+                label="Remind later",
+                style=discord.ButtonStyle.grey,
                 custom_id="update_prompt_deny",
-                emoji="⛔",
+                emoji="⏰",
             )
-            no_btn.callback = self._on_deny
-            self.add_item(no_btn)
+            later_btn.callback = self._on_deny
+            self.add_item(later_btn)
 
-            if self.default:
-                default_label = "Use Default"
-                if self.default.lower() in {"y", "yes"}:
-                    default_label = "Use Default (Yes)"
-                elif self.default.lower() in {"n", "no"}:
-                    default_label = "Use Default (No)"
-                default_btn = discord.ui.Button(
-                    label=default_label,
-                    style=discord.ButtonStyle.grey,
-                    custom_id="update_prompt_default",
-                    emoji="↩️",
-                )
-                default_btn.callback = self._on_default
-                self.add_item(default_btn)
+            skip_btn = discord.ui.Button(
+                label="Skip this version",
+                style=discord.ButtonStyle.grey,
+                custom_id="update_prompt_default",
+                emoji="⏭️",
+            )
+            skip_btn.callback = self._on_skip
+            self.add_item(skip_btn)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
@@ -6264,7 +6261,15 @@ def _define_discord_view_classes() -> None:
             await self._respond(interaction, "y", discord.Color.green(), "Yes")
 
         async def _on_deny(self, interaction: discord.Interaction):
-            await self._respond(interaction, "n", discord.Color.red(), "No")
+            await self._respond(interaction, "n", discord.Color.greyple(), "Remind later")
+
+        async def _on_skip(self, interaction: discord.Interaction):
+            # The current gateway update IPC is yes/no text based.  "Skip this
+            # version" is intentionally conservative: it answers no to the
+            # running update/investigation prompt.  A future update scheduler
+            # can distinguish skip-vs-remind by extending the prompt payload
+            # without changing the visible first-stage button copy.
+            await self._respond(interaction, "n", discord.Color.greyple(), "Skipped")
 
         async def _on_default(self, interaction: discord.Interaction):
             answer = self.default or ""
