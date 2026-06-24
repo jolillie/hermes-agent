@@ -1109,6 +1109,33 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 await self._handle_message(message, role_authorized=_role_authorized)
 
+            @self._client.listen("on_interaction")
+            async def on_hermes_update_interaction(interaction: Any):
+                """Handle Jon-local persistent update workflow buttons.
+
+                The daily version checker posts Discord components through the
+                REST API, outside discord.py's in-memory View registry.  That
+                means decorator-based View callbacks will not fire for those
+                messages after a gateway restart.  Catch the stable custom_id
+                prefix here and dispatch it explicitly; all other interactions
+                are left to discord.py's normal command/view machinery.
+                """
+                try:
+                    data = getattr(interaction, "data", None) or {}
+                    custom_id = data.get("custom_id") if isinstance(data, dict) else None
+                    if isinstance(custom_id, str) and custom_id.startswith("hermes_update_"):
+                        await adapter_self._handle_hermes_update_interaction(interaction, custom_id)
+                except Exception as exc:
+                    logger.error("Discord Hermes update interaction failed: %s", exc, exc_info=True)
+                    try:
+                        if not interaction.response.is_done():
+                            await interaction.response.send_message(
+                                "Sorry, that update action failed before it could start.",
+                                ephemeral=True,
+                            )
+                    except Exception:
+                        pass
+
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
@@ -1176,6 +1203,182 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._cancel_bot_task()
             self._release_platform_lock()
             return False
+
+    async def _handle_hermes_update_interaction(
+        self, interaction: Any, custom_id: str,
+    ) -> None:
+        """Dispatch Jon-local Hermes update notification buttons.
+
+        These buttons are emitted by ``~/.hermes/scripts/hermes_version_check.py``
+        as raw Discord components so the daily checker can run outside the
+        gateway.  Raw components are not associated with an in-memory
+        ``discord.ui.View`` after restarts, so we handle the stable custom IDs
+        here.
+        """
+        channel = getattr(interaction, "channel", None)
+        channel_id = str(getattr(channel, "id", "") or "")
+        user = getattr(interaction, "user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        display_name = getattr(user, "display_name", None) or getattr(user, "name", "operator")
+        self._log_hermes_update_action(
+            f"received custom_id={custom_id} channel={channel_id or 'unknown'} user={display_name}({user_id or 'unknown'})"
+        )
+
+        if not _component_check_auth(
+            interaction, self._allowed_user_ids, self._allowed_role_ids,
+        ):
+            self._log_hermes_update_action(f"rejected unauthorized custom_id={custom_id} user={user_id or 'unknown'}")
+            await interaction.response.send_message(
+                "You're not authorized to use this update control.",
+                ephemeral=True,
+            )
+            return
+
+        if custom_id == "hermes_update_investigate_now":
+            await interaction.response.send_message(
+                "🔎 Starting Hermes update investigation. I’ll post the result here when the eval/test run finishes.",
+                ephemeral=True,
+            )
+            self._log_hermes_update_action(f"acknowledged investigate_now channel={channel_id or 'unknown'}")
+            if channel is not None:
+                with suppress(Exception):
+                    await channel.send(
+                        f"🔎 Hermes update investigation started by {display_name}. "
+                        "Production will not be changed or restarted by this step."
+                    )
+            asyncio.create_task(
+                self._run_hermes_update_investigation(channel_id=channel_id)
+            )
+            self._log_hermes_update_action(f"queued investigation task channel={channel_id or 'unknown'}")
+            return
+
+        if custom_id == "hermes_update_remind_later":
+            pair = self._record_hermes_update_button_state(
+                "remind_later",
+                channel_id=channel_id,
+                user_id=user_id,
+                display_name=display_name,
+                clear_last_notified=True,
+            )
+            self._log_hermes_update_action(
+                f"acknowledged remind_later channel={channel_id or 'unknown'} pair={pair or 'unknown'}"
+            )
+            await interaction.response.send_message(
+                "⏰ Got it — I’ll remind you on the next scheduled update check if this version is still current. No production changes made.",
+                ephemeral=True,
+            )
+            return
+
+        if custom_id == "hermes_update_skip_version":
+            pair = self._record_hermes_update_button_state(
+                "skip_version",
+                channel_id=channel_id,
+                user_id=user_id,
+                display_name=display_name,
+                clear_last_notified=False,
+            )
+            self._log_hermes_update_action(
+                f"acknowledged skip_version channel={channel_id or 'unknown'} pair={pair or 'unknown'}"
+            )
+            await interaction.response.send_message(
+                "⏭️ Got it — skipping this version notification. I won’t re-notify until the candidate changes. No production changes made.",
+                ephemeral=True,
+            )
+            return
+
+        self._log_hermes_update_action(f"unknown custom_id={custom_id}")
+        await interaction.response.send_message(
+            "Unknown Hermes update action.",
+            ephemeral=True,
+        )
+
+    def _log_hermes_update_action(self, message: str) -> None:
+        """Append a durable local audit line for Discord update-button actions."""
+        try:
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            path = Path("/home/bot/.hermes/logs/hermes-update-buttons-actions.log")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            line = f"{datetime.now(timezone.utc).isoformat()} {message}\n"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+            logger.info("Hermes update button: %s", message)
+        except Exception:
+            logger.debug("Could not write Hermes update button audit log", exc_info=True)
+
+    def _record_hermes_update_button_state(
+        self,
+        action: str,
+        *,
+        channel_id: str,
+        user_id: str,
+        display_name: str,
+        clear_last_notified: bool,
+    ) -> str:
+        """Persist button state for Remind later / Skip this version.
+
+        The version checker suppresses duplicate notices via
+        ``last-notified.txt``.  "Remind later" clears that marker so the next
+        scheduled checker can post again for the same candidate.  "Skip this
+        version" leaves it intact, so the current candidate remains suppressed
+        until the upstream pair changes.
+        """
+        try:
+            from datetime import datetime, timezone
+            from pathlib import Path
+            import json as _json
+
+            state_dir = Path("/home/bot/.hermes/jobs/hermes_version_check")
+            state_dir.mkdir(parents=True, exist_ok=True)
+            marker = state_dir / "last-notified.txt"
+            pair = marker.read_text(errors="replace").strip() if marker.exists() else ""
+            record = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "action": action,
+                "pair": pair,
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "display_name": display_name,
+            }
+            with (state_dir / "button-actions.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(record, sort_keys=True) + "\n")
+            if clear_last_notified and marker.exists():
+                marker.unlink()
+            return pair
+        except Exception as exc:
+            self._log_hermes_update_action(
+                f"failed to record button state action={action} error={exc}"
+            )
+            return ""
+
+    async def _run_hermes_update_investigation(self, *, channel_id: str) -> None:
+        """Run the local safe update-evaluation script outside the event loop."""
+        script = "/home/bot/.hermes/scripts/hermes_update_investigate.py"
+        if not os.path.exists(script):
+            logger.error("Hermes update investigation script missing: %s", script)
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "python3",
+                script,
+                "--channel-id",
+                channel_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await proc.communicate()
+            text = (stdout or b"").decode(errors="replace")[-4000:]
+            if proc.returncode:
+                logger.error(
+                    "Hermes update investigation failed with exit %s: %s",
+                    proc.returncode,
+                    text,
+                )
+            else:
+                logger.info("Hermes update investigation completed: %s", text[-1000:])
+        except Exception as exc:
+            logger.error("Could not launch Hermes update investigation: %s", exc, exc_info=True)
 
     async def _cancel_bot_task(self) -> None:
         """Cancel and await the background client.start() task, if running."""
@@ -6175,40 +6378,43 @@ def _define_discord_view_classes() -> None:
         def _build_buttons(self) -> None:
             """Build explicit buttons instead of relying on decorator magic.
 
-            Jon's fork carries this as a local UX patch: the gateway-facing
-            update prompt is the first stage of a safe update flow.  The
-            primary action should read as an investigation, not immediate
-            production approval; promotion/restart remains a later explicit
-            step after tests pass.  Programmatic buttons are also easier to
-            test with Hermes' lightweight Discord mock than decorator-collected
-            methods.
+            Jon's fork carries this as a local UX patch: update prompts should
+            read like approval actions, not a vague yes/no quiz.  Programmatic
+            buttons are also easier to test with Hermes' lightweight Discord
+            mock than decorator-collected methods.
             """
-            investigate_btn = discord.ui.Button(
-                label="Investigate now",
+            yes_btn = discord.ui.Button(
+                label="Approve / Yes",
                 style=discord.ButtonStyle.green,
                 custom_id="update_prompt_approve",
-                emoji="🔎",
+                emoji="✅",
             )
-            investigate_btn.callback = self._on_approve
-            self.add_item(investigate_btn)
+            yes_btn.callback = self._on_approve
+            self.add_item(yes_btn)
 
-            later_btn = discord.ui.Button(
-                label="Remind later",
-                style=discord.ButtonStyle.grey,
+            no_btn = discord.ui.Button(
+                label="Deny / No",
+                style=discord.ButtonStyle.red,
                 custom_id="update_prompt_deny",
-                emoji="⏰",
+                emoji="⛔",
             )
-            later_btn.callback = self._on_deny
-            self.add_item(later_btn)
+            no_btn.callback = self._on_deny
+            self.add_item(no_btn)
 
-            skip_btn = discord.ui.Button(
-                label="Skip this version",
-                style=discord.ButtonStyle.grey,
-                custom_id="update_prompt_default",
-                emoji="⏭️",
-            )
-            skip_btn.callback = self._on_skip
-            self.add_item(skip_btn)
+            if self.default:
+                default_label = "Use Default"
+                if self.default.lower() in {"y", "yes"}:
+                    default_label = "Use Default (Yes)"
+                elif self.default.lower() in {"n", "no"}:
+                    default_label = "Use Default (No)"
+                default_btn = discord.ui.Button(
+                    label=default_label,
+                    style=discord.ButtonStyle.grey,
+                    custom_id="update_prompt_default",
+                    emoji="↩️",
+                )
+                default_btn.callback = self._on_default
+                self.add_item(default_btn)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
@@ -6261,15 +6467,7 @@ def _define_discord_view_classes() -> None:
             await self._respond(interaction, "y", discord.Color.green(), "Yes")
 
         async def _on_deny(self, interaction: discord.Interaction):
-            await self._respond(interaction, "n", discord.Color.greyple(), "Remind later")
-
-        async def _on_skip(self, interaction: discord.Interaction):
-            # The current gateway update IPC is yes/no text based.  "Skip this
-            # version" is intentionally conservative: it answers no to the
-            # running update/investigation prompt.  A future update scheduler
-            # can distinguish skip-vs-remind by extending the prompt payload
-            # without changing the visible first-stage button copy.
-            await self._respond(interaction, "n", discord.Color.greyple(), "Skipped")
+            await self._respond(interaction, "n", discord.Color.red(), "No")
 
         async def _on_default(self, interaction: discord.Interaction):
             answer = self.default or ""

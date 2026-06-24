@@ -20,6 +20,7 @@ import pytest
 # importing the production module.
 from plugins.platforms.discord.adapter import (  # noqa: E402
     ClarifyChoiceView,
+    DiscordAdapter,
     ExecApprovalView,
     ModelPickerView,
     SlashConfirmView,
@@ -235,7 +236,7 @@ def test_update_prompt_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
 
 
-def test_update_prompt_view_builds_investigation_action_buttons():
+def test_update_prompt_view_builds_approval_action_buttons():
     view = UpdatePromptView(
         session_key="sess-1",
         allowed_user_ids={"11111"},
@@ -245,7 +246,7 @@ def test_update_prompt_view_builds_investigation_action_buttons():
     labels = [child.label for child in view.children]
     custom_ids = [child.custom_id for child in view.children]
 
-    assert labels == ["Investigate now", "Remind later", "Skip this version"]
+    assert labels == ["Approve / Yes", "Deny / No", "Use Default (Yes)"]
     assert custom_ids == [
         "update_prompt_approve",
         "update_prompt_deny",
@@ -253,14 +254,10 @@ def test_update_prompt_view_builds_investigation_action_buttons():
     ]
 
 
-def test_update_prompt_view_always_offers_skip_button_without_default():
+def test_update_prompt_view_omits_default_button_without_default():
     view = UpdatePromptView(session_key="sess-1", allowed_user_ids={"11111"})
 
-    assert [child.label for child in view.children] == [
-        "Investigate now",
-        "Remind later",
-        "Skip this version",
-    ]
+    assert [child.label for child in view.children] == ["Approve / Yes", "Deny / No"]
 
 
 def test_model_picker_view_accepts_role_allowlist():
@@ -377,3 +374,80 @@ def test_component_check_pairing_import_error_graceful(monkeypatch):
     with patch("gateway.pairing.PairingStore", side_effect=ImportError("simulated")):
         interaction = _interaction(11111)
         assert _component_check_auth(interaction, set(), set()) is False
+
+
+@pytest.mark.asyncio
+async def test_hermes_update_investigate_button_auth_and_queues(monkeypatch):
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter._allowed_user_ids = {"11111"}
+    adapter._allowed_role_ids = set()
+
+    sent_responses = []
+    channel_messages = []
+    queued = []
+
+    class _Response:
+        async def send_message(self, content, *, ephemeral=False):
+            sent_responses.append((content, ephemeral))
+
+    class _Channel:
+        id = 12345
+
+        async def send(self, content):
+            channel_messages.append(content)
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=11111, display_name="Jon"),
+        response=_Response(),
+        channel=_Channel(),
+    )
+
+    async def _fake_run(*, channel_id):
+        queued.append(channel_id)
+
+    def _fake_create_task(coro):
+        coro.close()
+        queued.append("task-created")
+        return SimpleNamespace(done=lambda: True)
+
+    adapter._run_hermes_update_investigation = _fake_run
+    monkeypatch.setattr("plugins.platforms.discord.adapter.asyncio.create_task", _fake_create_task)
+
+    await adapter._handle_hermes_update_interaction(
+        interaction, "hermes_update_investigate_now"
+    )
+
+    assert sent_responses == [
+        (
+            "🔎 Starting Hermes update investigation. I’ll post the result here when the eval/test run finishes.",
+            True,
+        )
+    ]
+    assert "Hermes update investigation started by Jon" in channel_messages[0]
+    assert queued == ["task-created"]
+
+
+@pytest.mark.asyncio
+async def test_hermes_update_button_rejects_unauthorized_user():
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter._allowed_user_ids = {"11111"}
+    adapter._allowed_role_ids = set()
+    sent_responses = []
+
+    class _Response:
+        async def send_message(self, content, *, ephemeral=False):
+            sent_responses.append((content, ephemeral))
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=99999, display_name="Mallory"),
+        response=_Response(),
+        channel=SimpleNamespace(id=12345),
+    )
+
+    await adapter._handle_hermes_update_interaction(
+        interaction, "hermes_update_investigate_now"
+    )
+
+    assert sent_responses == [
+        ("You're not authorized to use this update control.", True)
+    ]
