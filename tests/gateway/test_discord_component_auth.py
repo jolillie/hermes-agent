@@ -20,6 +20,7 @@ import pytest
 # importing the production module.
 from plugins.platforms.discord.adapter import (  # noqa: E402
     ClarifyChoiceView,
+    DiscordAdapter,
     ExecApprovalView,
     ModelPickerView,
     SlashConfirmView,
@@ -328,3 +329,80 @@ def test_view_empty_allowlists_allow_with_explicit_allow_all(monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
     view = ExecApprovalView(session_key="s", allowed_user_ids=set())
     assert view._check_auth(_interaction(99999)) is True
+
+
+@pytest.mark.asyncio
+async def test_hermes_update_investigate_button_auth_and_queues(monkeypatch):
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter._allowed_user_ids = {"11111"}
+    adapter._allowed_role_ids = set()
+
+    sent_responses = []
+    channel_messages = []
+    queued = []
+
+    class _Response:
+        async def send_message(self, content, *, ephemeral=False):
+            sent_responses.append((content, ephemeral))
+
+    class _Channel:
+        id = 12345
+
+        async def send(self, content):
+            channel_messages.append(content)
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=11111, display_name="Jon"),
+        response=_Response(),
+        channel=_Channel(),
+    )
+
+    async def _fake_run(*, channel_id):
+        queued.append(channel_id)
+
+    def _fake_create_task(coro):
+        coro.close()
+        queued.append("task-created")
+        return SimpleNamespace(done=lambda: True)
+
+    adapter._run_hermes_update_investigation = _fake_run
+    monkeypatch.setattr("plugins.platforms.discord.adapter.asyncio.create_task", _fake_create_task)
+
+    await adapter._handle_hermes_update_interaction(
+        interaction, "hermes_update_investigate_now"
+    )
+
+    assert sent_responses == [
+        (
+            "🔎 Starting Hermes update investigation. I’ll post the result here when the eval/test run finishes.",
+            True,
+        )
+    ]
+    assert "Hermes update investigation started by Jon" in channel_messages[0]
+    assert queued == ["task-created"]
+
+
+@pytest.mark.asyncio
+async def test_hermes_update_button_rejects_unauthorized_user():
+    adapter = DiscordAdapter.__new__(DiscordAdapter)
+    adapter._allowed_user_ids = {"11111"}
+    adapter._allowed_role_ids = set()
+    sent_responses = []
+
+    class _Response:
+        async def send_message(self, content, *, ephemeral=False):
+            sent_responses.append((content, ephemeral))
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=99999, display_name="Mallory"),
+        response=_Response(),
+        channel=SimpleNamespace(id=12345),
+    )
+
+    await adapter._handle_hermes_update_interaction(
+        interaction, "hermes_update_investigate_now"
+    )
+
+    assert sent_responses == [
+        ("You're not authorized to use this update control.", True)
+    ]
